@@ -64,5 +64,28 @@ target_compile_options(bench_latency PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
 )
 
+add_executable(test_batched tests/test_batched.cu)
+target_include_directories(test_batched PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(test_batched PRIVATE topk_head CUDA::cudart CUDA::cublas)
+set_target_properties(test_batched PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(test_batched PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+)
+
+add_executable(bench_batched benchmarks/bench_batched.cu)
+target_include_directories(bench_batched PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(bench_batched PRIVATE topk_head CUDA::cudart CUDA::cublas)
+set_target_properties(bench_batched PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(bench_batched PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+)
+
 enable_testing()
 add_test(NAME correctness COMMAND test_correctness)
+add_test(NAME batched     COMMAND test_batched)
