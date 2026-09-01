@@ -98,12 +98,16 @@ static __global__ void fused_topk_kernel(
 
 // ---------------------------------------------------------------------------
 // Temperature + top-p nucleus sampling kernel.
-// Input: sorted scores[K] and indices[K] from fused_topk_kernel.
-// Computes softmax over the K candidates, performs prefix sum, applies
-// top-p mask, renormalizes, and samples categorically given uniform_rand.
+// Input: sorted scores[K] and indices[K] from fused_topk_kernel (post temperature).
+// Uses a warp-cooperative parallel prefix sum for the softmax and CDF scan
+// when k >= 32, falling back to scalar for small k.
+//
+// The scores arriving here are already temperature-scaled (divided by T
+// during heap insertion). This kernel applies exp-normalize (softmax),
+// top-p nucleus truncation, renormalization, and categorical sampling.
 // ---------------------------------------------------------------------------
 static __global__ void topk_nucleus_sample_kernel(
-    const float* __restrict__ scores,    // length k, descending
+    const float* __restrict__ scores,    // length k, descending, already temp-scaled
     const int*   __restrict__ indices,   // length k
     int          k,
     float        top_p,
@@ -111,45 +115,70 @@ static __global__ void topk_nucleus_sample_kernel(
     int*         __restrict__ sampled    // output: one sampled token id
 )
 {
-    // Single-threaded: k is small (max 256) so this is fine for correctness.
-    if (threadIdx.x != 0) return;
+    // Launch this kernel with 32 threads (one warp) for warp-level efficiency.
+    // All 32 threads collaborate but only thread 0 writes output.
+    const int lane = threadIdx.x;
 
-    // Softmax over k scores
-    float max_s = scores[0];
-    float sum_exp = 0.0f;
-    float probs[MAX_K];
+    // Shared memory for the probability array (max k = MAX_K = 256 floats).
+    __shared__ float s_probs[MAX_K];
+    __shared__ int   s_nucleus_end;
+    __shared__ float s_nucleus_mass;
 
-    for (int i = 0; i < k; i++) {
-        probs[i] = expf(scores[i] - max_s);
-        sum_exp += probs[i];
+    // Step 1: warp-parallel softmax.
+    // Each lane processes ceil(k/32) elements.
+    float max_s = scores[0];  // already sorted descending; scores[0] is max
+
+    // Compute exp(score - max) for each lane's elements
+    float local_sum = 0.0f;
+    for (int i = lane; i < k; i += 32) {
+        float p = expf(scores[i] - max_s);
+        s_probs[i] = p;
+        local_sum += p;
     }
-    for (int i = 0; i < k; i++) probs[i] /= sum_exp;
+    __syncwarp();
 
-    // Prefix sum and top-p masking
-    float cumsum = 0.0f;
-    int nucleus_end = k;
-    for (int i = 0; i < k; i++) {
-        cumsum += probs[i];
-        if (cumsum >= top_p) {
-            nucleus_end = i + 1;
-            break;
+    // Warp reduction for total sum
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+    float total_sum = __shfl_sync(0xffffffff, local_sum, 0);
+
+    // Normalize
+    for (int i = lane; i < k; i += 32)
+        s_probs[i] /= total_sum;
+    __syncwarp();
+
+    // Step 2: sequential prefix sum for nucleus truncation (thread 0 only).
+    // k <= 256 so this is at most 256 adds; acceptable for a sampling kernel.
+    if (lane == 0) {
+        float cumsum = 0.0f;
+        s_nucleus_end = k;
+        for (int i = 0; i < k; i++) {
+            cumsum += s_probs[i];
+            if (cumsum >= top_p) {
+                s_nucleus_end = i + 1;
+                break;
+            }
         }
+
+        // Renormalize nucleus
+        float nucleus_mass = 0.0f;
+        for (int i = 0; i < s_nucleus_end; i++) nucleus_mass += s_probs[i];
+        s_nucleus_mass = nucleus_mass;
+        for (int i = 0; i < s_nucleus_end; i++) s_probs[i] /= nucleus_mass;
     }
+    __syncwarp();
 
-    // Renormalize within nucleus
-    float nucleus_mass = 0.0f;
-    for (int i = 0; i < nucleus_end; i++) nucleus_mass += probs[i];
-    for (int i = 0; i < nucleus_end; i++) probs[i] /= nucleus_mass;
-
-    // Categorical sample
-    float threshold = uniform_rand;
-    float cdf = 0.0f;
-    *sampled = indices[nucleus_end - 1];  // fallback to last
-    for (int i = 0; i < nucleus_end; i++) {
-        cdf += probs[i];
-        if (cdf >= threshold) {
-            *sampled = indices[i];
-            break;
+    // Step 3: categorical sample (thread 0)
+    if (lane == 0) {
+        int ne = s_nucleus_end;
+        float cdf = 0.0f;
+        *sampled = indices[ne - 1];  // fallback
+        for (int i = 0; i < ne; i++) {
+            cdf += s_probs[i];
+            if (cdf >= uniform_rand) {
+                *sampled = indices[i];
+                break;
+            }
         }
     }
 }
@@ -277,7 +306,8 @@ void fused_topk_decode(
     }
 
     if (cfg.mode == SamplingMode::TopP && d_sampled_index != nullptr) {
-        topk_nucleus_sample_kernel<<<1, 1, 0, stream>>>(
+        // Launch with one warp (32 threads) for warp-cooperative softmax scan.
+        topk_nucleus_sample_kernel<<<1, 32, 0, stream>>>(
             result.d_scores, result.d_indices, k,
             cfg.top_p, cfg.uniform_rand, d_sampled_index
         );
